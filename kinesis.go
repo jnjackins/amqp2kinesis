@@ -22,6 +22,7 @@ type kinesisWriter struct {
 	partitionKey string
 	messages     chan []byte
 	flushTicker  <-chan time.Time
+	full         chan bool
 	lasterr      error
 }
 
@@ -39,22 +40,42 @@ func newKinesisWriter(partitionKey string) *kinesisWriter {
 		partitionKey: partitionKey,
 		messages:     make(chan []byte, bufsize),
 		flushTicker:  time.Tick(flushInterval),
+		full:         make(chan bool),
 	}
 
+	// periodically flush to kinesis
 	go func() {
-		for range w.flushTicker {
-			w.flush()
+		for {
+			select {
+			case <-w.flushTicker:
+				if err := w.flush(); err != nil {
+					w.lasterr = err
+				}
+			case <-w.full:
+				if err := w.flush(); err != nil {
+					w.lasterr = err
+				}
+			}
 		}
 	}()
 
 	return w
 }
 
-func (w *kinesisWriter) Write(payload []byte) {
-	w.messages <- payload
-	if len(w.messages) == bufsize {
-		w.flush()
+func (w *kinesisWriter) Write(payload []byte) error {
+	if w.lasterr != nil {
+		err := w.lasterr
+		w.lasterr = nil
+		return err
 	}
+
+	w.messages <- payload
+
+	// if the buffer is full, don't wait for next flush
+	if len(w.messages) == bufsize {
+		w.full <- true
+	}
+	return nil
 }
 
 func (w *kinesisWriter) flush() error {
